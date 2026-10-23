@@ -52,6 +52,11 @@ class ParseResult:
     retry_after: Optional[float] = None
     source_revision: Optional[str] = None
     processing_revision: Optional[str] = None
+    reason_code: Optional[str] = None
+    native_pages: int = 0
+    ocr_pages: int = 0
+    page_origins: Dict[int, str] = field(default_factory=dict)
+    quality_policy: Optional[str] = None
 
 
 @dataclass

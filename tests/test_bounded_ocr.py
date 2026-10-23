@@ -11,7 +11,7 @@ from pypdf import PdfWriter
 from kitng_doc_parser import ChunkCache, DocumentParser, DocumentRef, ParseBudget, ProviderAdmission
 from kitng_doc_parser.admission import ProviderCooldown
 from kitng_doc_parser.ocr.openrouter import OpenRouterClient, OpenRouterError, _parse_retry_after
-from kitng_doc_parser.pdf.chunking import extract_pdf_pages, extract_pdf_raw_text, get_pdf_page_count
+from kitng_doc_parser.pdf.chunking import extract_pdf_pages, extract_pdf_raw_text, get_pdf_page_count, inspect_pdf_pages
 from kitng_doc_parser.pdf.worker import pdf_operation
 
 
@@ -30,6 +30,7 @@ async def inline_pdf(operation, data, budget, start=0, end=0):
         budget.check()
     if operation == "count": return get_pdf_page_count(data)
     if operation == "chunk": return extract_pdf_pages(data, start, end)
+    if operation == "inspect": return inspect_pdf_pages(data)
     return extract_pdf_raw_text(data)
 
 
@@ -75,7 +76,7 @@ class BoundedOcrTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(429, headers={"retry-after": "30"})
             entered.set()
             await release.wait()
-            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
 
         clients = [OpenRouterClient("test", admission=admission) for _ in range(2)]
         for client in clients:
@@ -105,7 +106,7 @@ class BoundedOcrTests(unittest.IsolatedAsyncioTestCase):
         async def handler(request):
             calls.append(request)
             await asyncio.sleep(0.3)
-            return httpx.Response(200, json={"choices": [{"message": {"content": "late"}}]})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "late"}, "finish_reason": "stop"}]})
 
         client = OpenRouterClient("test", max_attempts=3)
         await client._client.aclose()
@@ -127,15 +128,15 @@ class BoundedOcrTests(unittest.IsolatedAsyncioTestCase):
             result = await parser.parse(ref, data, chunk_cache=cache, budget=ParseBudget.seconds(2))
             self.assertEqual((result.status, result.completed_chunks), ("partial", 1))
             self.assertEqual(len(client.calls), 1)
-            for _ in range(2):
+            for _ in range(4):
                 result = await parser.parse(ref, data, chunk_cache=cache, budget=ParseBudget.seconds(2))
-            self.assertEqual((result.status, len(client.calls)), ("complete", 3))
+            self.assertEqual((result.status, len(client.calls)), ("complete", 5))
             again = await parser.parse(ref, data, chunk_cache=cache, budget=ParseBudget.seconds(2))
-            self.assertEqual(len(client.calls), 3)
+            self.assertEqual(len(client.calls), 5)
             changed = await parser.parse(ref, pdf("other"), chunk_cache=cache, budget=ParseBudget.seconds(2))
             self.assertEqual(changed.completed_chunks, 1)
             self.assertNotEqual(changed.processing_revision, again.processing_revision)
-            self.assertEqual(len(client.calls), 4)
+            self.assertEqual(len(client.calls), 6)
 
     async def test_pdf_worker_process_and_deadline_cleanup(self):
         self.assertEqual(await pdf_operation("count", pdf(pages=2), ParseBudget.seconds(10)), 2)
@@ -162,15 +163,13 @@ class BoundedOcrTests(unittest.IsolatedAsyncioTestCase):
         parser = DocumentParser(client, chunk_size=2)
         async def expires_after_metadata(operation, data, budget, start=0, end=0):
             result = await inline_pdf(operation, data, budget, start, end)
-            if operation == "count":
+            if operation == "inspect":
                 budget.deadline = time.monotonic() - 1
             return result
         with tempfile.TemporaryDirectory() as directory, patch("kitng_doc_parser.pipeline.pdf_operation", expires_after_metadata):
-            result = await parser.parse(DocumentRef("scope", "doc", "doc.pdf"), pdf(),
-                                        chunk_cache=ChunkCache(directory), budget=ParseBudget.seconds(2))
-            self.assertEqual(result.error, "slice_deadline")
-            self.assertTrue(result.retryable)
-            self.assertEqual(result.completed_chunks, 0)
+            with self.assertRaises(TimeoutError):
+                await parser.parse(DocumentRef("scope", "doc", "doc.pdf"), pdf(),
+                                   chunk_cache=ChunkCache(directory), budget=ParseBudget.seconds(2))
             self.assertEqual(client.calls, [])
 
     async def test_admission_wait_counts_against_budget(self):

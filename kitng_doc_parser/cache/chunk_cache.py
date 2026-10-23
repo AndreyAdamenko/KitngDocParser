@@ -8,6 +8,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
+from ..quality import validate_markdown_quality, MAX_DOCUMENT_CHARS
 
 
 class ChunkCache:
@@ -52,11 +53,17 @@ class ChunkCache:
         if not path.is_file():
             return None
         try:
-            return path.read_text(encoding="utf-8")
+            if path.stat().st_size > MAX_DOCUMENT_CHARS * 4:
+                return None
+            text = path.read_text(encoding="utf-8")
+            return text if validate_markdown_quality(text).valid else None
         except OSError:
             return None
 
     def save_chunk(self, scope: str, item_id: str, chunk_index: int, markdown: str) -> None:
+        checked = validate_markdown_quality(markdown)
+        if not checked.valid:
+            raise ValueError("Invalid chunk content: " + checked.reason_code)
         doc_dir = self._doc_dir(scope, item_id)
         doc_dir.mkdir(parents=True, exist_ok=True)
         self._atomic_write(doc_dir / f"chunk_{chunk_index}.md", markdown)

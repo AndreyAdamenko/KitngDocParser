@@ -14,11 +14,13 @@ import httpx
 
 from ..admission import shared_admission, ProviderCooldown
 from .prompts import OCR_SYSTEM_PROMPT
+from ..quality import validate_markdown_quality, MAX_PAGE_CHARS, MAX_OUTPUT_TOKENS, MAX_RESPONSE_BYTES
 
 logger = logging.getLogger("kitng_doc_parser.ocr")
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 MAX_BACKOFF_SECONDS = 30.0
+DEFAULT_429_COOLDOWN_SECONDS = 60.0
 
 
 class OpenRouterError(Exception):
@@ -31,12 +33,14 @@ class OpenRouterError(Exception):
         retryable: bool = False,
         status: Optional[int] = None,
         retry_after: Optional[float] = None,
+        reason_code: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.retryable = retryable
         self.status = status
         self.retry_after = retry_after
+        self.reason_code = reason_code
 
 
 def _clean_markdown(text: str) -> str:
@@ -80,9 +84,15 @@ class OpenRouterClient:
         retry_base_seconds: float = 2.0,
         max_in_flight: int = 1,
         admission=None,
+        max_output_tokens: int = MAX_OUTPUT_TOKENS,
+        max_output_chars: int = MAX_PAGE_CHARS,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> None:
         self._admission = admission
         self._max_in_flight = max_in_flight
+        self._max_output_tokens = max(1, int(max_output_tokens))
+        self._max_output_chars = max(1, int(max_output_chars))
+        self._max_response_bytes = max(1, int(max_response_bytes))
         self._base_url = base_url
         self._api_key = api_key
         self._model_name = model_name
@@ -111,6 +121,32 @@ class OpenRouterClient:
         delay = base * (2 ** (attempt - 1)) + random.uniform(0, base)
         return min(delay, MAX_BACKOFF_SECONDS)
 
+    async def _bounded_post(self, payload, timeout):
+        async with self._client.stream("POST", "chat/completions", json=payload, timeout=timeout) as response:
+            # aiter_bytes() returns decoded bytes. Reusing Content-Encoding on
+            # the materialized response would attempt gzip/br decoding twice.
+            headers = {key: value for key, value in response.headers.items()
+                       if key.lower() not in {"content-encoding", "content-length"}}
+            # Error bodies may contain documents; their contents are unnecessary.
+            if response.status_code != 200:
+                return httpx.Response(response.status_code, headers=headers)
+            body = bytearray()
+            async for block in response.aiter_bytes():
+                if len(body) + len(block) > self._max_response_bytes:
+                    raise OpenRouterError("OCR quality rejected: response_size_limit", reason_code="invalid_content")
+                body.extend(block)
+            return httpx.Response(response.status_code, headers=headers, content=bytes(body))
+
+    async def _wait_retry(self, delay, budget, reason_code):
+        if delay <= 0: return
+        if budget and delay >= budget.remaining():
+            raise OpenRouterError("Provider retry deferred beyond slice budget", retryable=True,
+                                  retry_after=delay, reason_code=reason_code)
+        if budget:
+            await asyncio.wait_for(asyncio.sleep(delay), budget.remaining())
+        else:
+            await asyncio.sleep(delay)
+
     async def convert_to_markdown(
         self,
         data: bytes,
@@ -135,6 +171,7 @@ class OpenRouterClient:
         payload = {
             "model": self._model_name,
             "temperature": 0.1,
+            "max_tokens": self._max_output_tokens,
             "messages": [
                 {"role": "system", "content": OCR_SYSTEM_PROMPT},
                 {
@@ -158,32 +195,47 @@ class OpenRouterClient:
             try:
                 async with admission.slot(budget) as started_epoch:
                     timeout = min(self._client.timeout.read or 180.0, budget.remaining()) if budget else self._client.timeout
-                    request = self._client.post("chat/completions", json=payload, timeout=timeout)
+                    request = self._bounded_post(payload, timeout)
                     response = await asyncio.wait_for(request, budget.remaining()) if budget else await request
                     if response.status_code == 200:
                         admission.succeeded(started_epoch)
                     elif response.status_code in RETRYABLE_STATUS:
-                        last_retry_after = admission.failed(_parse_retry_after(response.headers.get("retry-after")), base)
+                        requested_delay = _parse_retry_after(response.headers.get("retry-after"))
+                        if response.status_code == 429 and requested_delay is None:
+                            requested_delay = DEFAULT_429_COOLDOWN_SECONDS
+                        last_retry_after = admission.failed(requested_delay, base)
             except ProviderCooldown as ex:
-                raise OpenRouterError("Provider cooldown", retryable=True, status=429, retry_after=ex.retry_after) from ex
+                raise OpenRouterError("Provider cooldown", retryable=True, status=429, retry_after=ex.retry_after, reason_code="provider_rate_limited") from ex
             except (httpx.HTTPError, TimeoutError) as ex:
                 last_retry_after = admission.failed(None, base)
                 last_error = type(ex).__name__
                 logger.warning("Сетевая ошибка OpenRouter (попытка %s/%s): %s", attempt, attempts, ex)
                 if attempt < attempts:
                     delay = last_retry_after if last_retry_after is not None else self._backoff(attempt, base)
-                    if delay > 0:
-                        await asyncio.sleep(delay)
+                    await self._wait_retry(delay, budget, "provider_timeout" if isinstance(ex, (TimeoutError, httpx.TimeoutException)) else "provider_unavailable")
                     continue
-                raise OpenRouterError(f"OpenRouter transport unavailable after {attempts} attempts: {last_error}", retryable=True, retry_after=last_retry_after) from ex
+                code = "provider_timeout" if isinstance(ex, (TimeoutError, httpx.TimeoutException)) else "provider_unavailable"
+                raise OpenRouterError(f"OpenRouter transport unavailable after {attempts} attempts: {last_error}", retryable=True, retry_after=last_retry_after, reason_code=code) from ex
 
             if response.status_code == 200:
                 try:
                     body = response.json()
-                    content = body["choices"][0]["message"]["content"] or ""
+                    choice = body["choices"][0]
+                    content = choice["message"]["content"]
                 except (ValueError, KeyError, IndexError, TypeError) as ex:
-                    raise OpenRouterError(f"Некорректный ответ OpenRouter: {ex}") from ex
-                return _clean_markdown(content)
+                    raise OpenRouterError("Invalid OpenRouter response schema", reason_code="invalid_content") from ex
+                checked = validate_markdown_quality(content, finish_reason=choice.get("finish_reason"),
+                    max_chars=self._max_output_chars, require_finish_reason=True)
+                tokens = body.get("usage", {}).get("completion_tokens") if isinstance(body.get("usage", {}), dict) else None
+                if not checked.valid:
+                    raise OpenRouterError("OCR quality rejected: " + checked.reason_code, reason_code="invalid_content")
+                if isinstance(tokens, (int, float)) and tokens > self._max_output_tokens:
+                    raise OpenRouterError("OCR quality rejected: output_token_limit", reason_code="invalid_content")
+                cleaned = _clean_markdown(content)
+                checked = validate_markdown_quality(cleaned, max_chars=self._max_output_chars)
+                if not checked.valid:
+                    raise OpenRouterError("OCR quality rejected: " + checked.reason_code, reason_code="invalid_content")
+                return cleaned
 
             last_status = response.status_code
             last_retry_after = max(admission.retry_after, _parse_retry_after(response.headers.get("retry-after")) or 0.0)
@@ -192,9 +244,9 @@ class OpenRouterClient:
             logger.warning("OpenRouter вернул %s (попытка %s/%s, retryable=%s)", response.status_code, attempt, attempts, retryable)
             if retryable and attempt < attempts:
                 delay = last_retry_after if last_retry_after is not None else self._backoff(attempt, base)
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                await self._wait_retry(delay, budget, "provider_rate_limited" if last_status == 429 else "provider_unavailable")
                 continue
-            raise OpenRouterError(f"OpenRouter error {last_error}", retryable=retryable, status=last_status, retry_after=last_retry_after)
+            raise OpenRouterError(f"OpenRouter error {last_error}", retryable=retryable, status=last_status, retry_after=last_retry_after,
+                                  reason_code="provider_rate_limited" if last_status == 429 else "provider_unavailable")
 
         raise OpenRouterError(f"OpenRouter недоступен: {last_error}", retryable=True, status=last_status, retry_after=last_retry_after)

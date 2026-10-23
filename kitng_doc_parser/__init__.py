@@ -2,6 +2,7 @@
 
 from .budget import ParseBudget
 from .admission import ProviderAdmission
+from .quality import QualityCheck, validate_markdown_quality, QUALITY_POLICY
 from .models import DocumentRef, ParseResult, CacheEntry
 from .concurrency import DocumentLockRegistry
 from .pipeline import DocumentParser
@@ -12,9 +13,10 @@ from .extractors.docx import extract_docx_markdown
 from .extractors.xlsx import extract_xlsx_markdown
 from .extractors.text import extract_text_markdown
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
+    "QualityCheck", "validate_markdown_quality", "QUALITY_POLICY",
     "ParseBudget",
     "ProviderAdmission",
     "DocumentParser",
