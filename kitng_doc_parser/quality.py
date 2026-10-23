@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import re
 from typing import Any, Optional
 
-QUALITY_POLICY = "page-native-ocr-quality-v2"
+QUALITY_POLICY = "page-native-raster-ocr-quality-v3"
 MAX_PAGE_CHARS = 65_536
 MAX_DOCUMENT_CHARS = 16 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 16_384

@@ -22,14 +22,29 @@
 pip install -e C:\Users\a.adamenko\source\repos\KitngDocParser
 ```
 
-## PDF policy 1.2
+## PDF policy 1.2.1
 
 PDF processing uses one native-text inspection pass in a disposable subprocess
 when a `ParseBudget` is supplied. All usable native pages are checkpointed in
 that slice. The budget's `max_new_chunks` limits **paid OCR pages**, not native
-pages. PDF OCR always sends one page per request; legacy `chunk_size` and
+pages. PDF OCR always renders one original page and sends its PNG image, never
+the raw PDF, to avoid provider-dependent PDF preprocessing. Legacy `chunk_size` and
 `chunk_threshold` constructor arguments remain accepted for caller compatibility.
 Without an explicit budget the caller retains control of overall parse duration.
+Rasterization still receives a bounded 90-second operation budget and always
+runs in a disposable subprocess. A caller budget/cancellation applies to rendering
+and transport together when supplied.
+
+Rendering uses `pypdfium2>=5.14,<6` and `Pillow>=10,<13` with an opaque white
+background, annotations and initialized form fields. The page keeps its original
+rotation and page number. Allocation is checked before rendering: at most 2,000
+pixels on the long side and 4,000,000 pixels total. PNG encoding is limited to
+8 MiB. Render errors return explicit nonretryable `renderer_*` reasons; there is
+no raw-PDF fallback. These bounds do not guarantee readability of arbitrarily
+large engineering sheets, which require separate quality review.
+
+The renderer follows the official [pypdfium2 API](https://pypdfium2.readthedocs.io/en/stable/python_api.html)
+and closes PIL images, bitmaps, pages and documents in dependency order.
 
 A native page needs at least 40 visible / 20 alphanumeric characters, no excessive
 replacement/private-use characters, valid bounded content, and no significant

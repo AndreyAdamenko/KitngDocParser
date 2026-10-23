@@ -13,6 +13,7 @@ from kitng_doc_parser.admission import ProviderCooldown
 from kitng_doc_parser.ocr.openrouter import OpenRouterClient, OpenRouterError, _parse_retry_after
 from kitng_doc_parser.pdf.chunking import extract_pdf_pages, extract_pdf_raw_text, get_pdf_page_count, inspect_pdf_pages
 from kitng_doc_parser.pdf.worker import pdf_operation
+from kitng_doc_parser.pdf.raster import render_pdf_page_png
 
 
 def pdf(note="first", pages=5):
@@ -31,6 +32,7 @@ async def inline_pdf(operation, data, budget, start=0, end=0):
     if operation == "count": return get_pdf_page_count(data)
     if operation == "chunk": return extract_pdf_pages(data, start, end)
     if operation == "inspect": return inspect_pdf_pages(data)
+    if operation == "render_png": return render_pdf_page_png(data, start)
     return extract_pdf_raw_text(data)
 
 

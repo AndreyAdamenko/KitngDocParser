@@ -52,8 +52,12 @@ class FakeOcr:
     model_name = 'synthetic'
     def __init__(self, output=TEXT): self.calls, self.output = [], output
     async def convert_to_markdown(self, data, mime, prompt=None, **kwargs):
-        from kitng_doc_parser.pdf.chunking import get_pdf_page_count
-        self.calls.append(get_pdf_page_count(data))
+        from PIL import Image
+        assert mime == 'image/png'
+        with Image.open(io.BytesIO(data)) as image:
+            assert image.format == 'PNG'
+            assert max(image.size) <= 2000 and image.width * image.height <= 4_000_000
+        self.calls.append(1)
         return self.output
 
 

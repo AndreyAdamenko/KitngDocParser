@@ -17,6 +17,7 @@ from .extractors.xlsx import extract_xlsx_markdown
 from .models import DocumentRef, ParseResult
 from .ocr.openrouter import OpenRouterClient, OpenRouterError
 from .pdf.worker import pdf_operation
+from .pdf.raster import PdfRenderError, MAX_RENDER_LONG_SIDE, MAX_RENDER_PIXELS, MAX_RENDER_PNG_BYTES
 from .quality import validate_markdown_quality, native_page_quality, QUALITY_POLICY
 from .pdf.chunking import extract_pdf_pages, extract_pdf_raw_text, get_pdf_page_count
 
@@ -140,8 +141,11 @@ class DocumentParser:
         )
 
     def processing_revision(self, data: bytes, cache_generation: str = "") -> str:
-        policy = {"schema": 3, "generation": cache_generation, "parser": "1.2.0",
+        policy = {"schema": 4, "generation": cache_generation, "parser": "1.2.1",
                   "quality": QUALITY_POLICY, "prompt": "ocr-v2-leaders", "ocr_page_size": 1,
+                  "ocr_input": "rendered_png", "renderer": "pypdfium2-v5",
+                  "render_long_side": MAX_RENDER_LONG_SIDE, "render_pixels": MAX_RENDER_PIXELS,
+                  "render_png_bytes": MAX_RENDER_PNG_BYTES,
                   "native_first": True, "model": self._openrouter.model_name if self._openrouter else None,
                   "route": getattr(self._openrouter, "_base_url", None)}
         return hashlib.sha256(hashlib.sha256(data).digest() + json.dumps(policy, sort_keys=True).encode()).hexdigest()
@@ -221,15 +225,19 @@ class DocumentParser:
                 break
             try:
                 if budget: budget.check()
-                chunk_data = await pdf_operation("chunk", data, budget, index + 1, index + 1)
+                raster = await pdf_operation("render_png", data, budget, index + 1, index + 1)
                 prompt = f"Распознай страницу {index+1} из {total_pages} документа '{ref.file_name}' и переведи её в точный Markdown."
-                text = await self._openrouter.convert_to_markdown(chunk_data, "application/pdf", prompt,
+                text = await self._openrouter.convert_to_markdown(raster["png"], "image/png", prompt,
                     **({"budget": budget} if budget else {}))
                 if budget: budget.check()
                 new_ocr_pages += 1
                 checked = validate_markdown_quality(text, page_count=1)
                 if not checked.valid:
                     raise OpenRouterError("OCR quality rejected: " + checked.reason_code, reason_code="invalid_content")
+            except PdfRenderError as ex:
+                failed_error, reason_code, failed_index = str(ex), ex.reason_code, index
+                meta.update(status="failed", reason_code=reason_code, retryable=False, parsed_at=_now())
+                break
             except TimeoutError:
                 failed_error, reason_code, failed_index, retryable = "slice_deadline", "slice_deadline", index, True
                 break
@@ -241,7 +249,8 @@ class DocumentParser:
                 break
             save(index, text)
             meta.update(status="done", origin="ocr", model=self._openrouter.model_name,
-                        chars=len(text), parsed_at=_now(), quality_policy=QUALITY_POLICY)
+                        chars=len(text), parsed_at=_now(), quality_policy=QUALITY_POLICY,
+                        input_format="image/png", rendered_width=raster["width"], rendered_height=raster["height"])
             persist()
 
         # Revalidate every reused checkpoint before assembly, even in a current

@@ -13,7 +13,7 @@ from .extractors.docx import extract_docx_markdown
 from .extractors.xlsx import extract_xlsx_markdown
 from .extractors.text import extract_text_markdown
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 __all__ = [
     "QualityCheck", "validate_markdown_quality", "QUALITY_POLICY",

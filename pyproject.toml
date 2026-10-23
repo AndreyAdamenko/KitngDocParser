@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kitng-doc-parser"
-version = "1.2.0"
+version = "1.2.1"
 description = "Универсальный конвейер парсинга инженерных и управленческих документов в Markdown для MCP-серверов KITNG"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,8 @@ dependencies = [
     "python-docx>=1.1.0",
     "openpyxl>=3.1.0",
     "pypdf>=4.0.0",
+    "pypdfium2>=5.14.0,<6",
+    "Pillow>=10,<13",
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
 ]
