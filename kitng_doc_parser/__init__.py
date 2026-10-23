@@ -1,5 +1,7 @@
 """Универсальный конвейер парсинга документов в Markdown для MCP-серверов KITNG."""
 
+from .budget import ParseBudget
+from .admission import ProviderAdmission
 from .models import DocumentRef, ParseResult, CacheEntry
 from .concurrency import DocumentLockRegistry
 from .pipeline import DocumentParser
@@ -10,9 +12,11 @@ from .extractors.docx import extract_docx_markdown
 from .extractors.xlsx import extract_xlsx_markdown
 from .extractors.text import extract_text_markdown
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
+    "ParseBudget",
+    "ProviderAdmission",
     "DocumentParser",
     "MdCache",
     "ChunkCache",

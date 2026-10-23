@@ -17,6 +17,12 @@ class ChunkCache:
         self._root = Path(root) / "chunks"
         self._root.mkdir(parents=True, exist_ok=True)
 
+    def for_revision(self, revision: str) -> "ChunkCache":
+        """Never reuse checkpoints belonging to other source/policy bytes."""
+        if not revision or any(c not in "0123456789abcdef" for c in revision):
+            raise ValueError("Invalid processing revision")
+        return ChunkCache(self._root.parent / "revisions" / revision)
+
     def _hash_key(self, item_id: str) -> str:
         return hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:16]
 

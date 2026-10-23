@@ -12,6 +12,7 @@ from typing import Optional
 
 import httpx
 
+from ..admission import shared_admission, ProviderCooldown
 from .prompts import OCR_SYSTEM_PROMPT
 
 logger = logging.getLogger("kitng_doc_parser.ocr")
@@ -77,7 +78,12 @@ class OpenRouterClient:
         timeout_seconds: float = 180.0,
         max_attempts: int = 3,
         retry_base_seconds: float = 2.0,
+        max_in_flight: int = 1,
+        admission=None,
     ) -> None:
+        self._admission = admission
+        self._max_in_flight = max_in_flight
+        self._base_url = base_url
         self._api_key = api_key
         self._model_name = model_name
         self._max_attempts = max_attempts
@@ -110,6 +116,7 @@ class OpenRouterClient:
         data: bytes,
         mime_type: str,
         prompt: Optional[str] = None,
+        *, budget=None,
     ) -> str:
         if not self._api_key:
             raise OpenRouterError("OPENROUTER_API_KEY не задан.", retryable=False)
@@ -140,7 +147,8 @@ class OpenRouterClient:
             ],
         }
 
-        attempts = max(1, self._max_attempts)
+        admission = self._admission or shared_admission(self._api_key, self._model_name, self._base_url, self._max_in_flight)
+        attempts = max(1, budget.max_attempts if budget else self._max_attempts)
         base = max(0.0, float(self._retry_base_seconds))
         last_error = ""
         last_status: Optional[int] = None
@@ -148,16 +156,26 @@ class OpenRouterClient:
 
         for attempt in range(1, attempts + 1):
             try:
-                response = await self._client.post("chat/completions", json=payload)
-            except httpx.HTTPError as ex:
-                last_error = str(ex)
+                async with admission.slot(budget) as started_epoch:
+                    timeout = min(self._client.timeout.read or 180.0, budget.remaining()) if budget else self._client.timeout
+                    request = self._client.post("chat/completions", json=payload, timeout=timeout)
+                    response = await asyncio.wait_for(request, budget.remaining()) if budget else await request
+                    if response.status_code == 200:
+                        admission.succeeded(started_epoch)
+                    elif response.status_code in RETRYABLE_STATUS:
+                        last_retry_after = admission.failed(_parse_retry_after(response.headers.get("retry-after")), base)
+            except ProviderCooldown as ex:
+                raise OpenRouterError("Provider cooldown", retryable=True, status=429, retry_after=ex.retry_after) from ex
+            except (httpx.HTTPError, TimeoutError) as ex:
+                last_retry_after = admission.failed(None, base)
+                last_error = type(ex).__name__
                 logger.warning("Сетевая ошибка OpenRouter (попытка %s/%s): %s", attempt, attempts, ex)
                 if attempt < attempts:
-                    delay = self._backoff(attempt, base)
+                    delay = last_retry_after if last_retry_after is not None else self._backoff(attempt, base)
                     if delay > 0:
                         await asyncio.sleep(delay)
                     continue
-                raise OpenRouterError(f"OpenRouter недоступен после {attempts} попыток: {last_error}", retryable=True) from ex
+                raise OpenRouterError(f"OpenRouter transport unavailable after {attempts} attempts: {last_error}", retryable=True, retry_after=last_retry_after) from ex
 
             if response.status_code == 200:
                 try:
@@ -168,8 +186,8 @@ class OpenRouterClient:
                 return _clean_markdown(content)
 
             last_status = response.status_code
-            last_retry_after = _parse_retry_after(response.headers.get("retry-after"))
-            last_error = f"{response.status_code}: {response.text[:300]}"
+            last_retry_after = max(admission.retry_after, _parse_retry_after(response.headers.get("retry-after")) or 0.0)
+            last_error = str(response.status_code)  # provider bodies can contain document data; never log them
             retryable = response.status_code in RETRYABLE_STATUS
             logger.warning("OpenRouter вернул %s (попытка %s/%s, retryable=%s)", response.status_code, attempt, attempts, retryable)
             if retryable and attempt < attempts:

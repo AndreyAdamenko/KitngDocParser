@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -13,6 +16,7 @@ from .extractors.text import extract_text_markdown
 from .extractors.xlsx import extract_xlsx_markdown
 from .models import DocumentRef, ParseResult
 from .ocr.openrouter import OpenRouterClient, OpenRouterError
+from .pdf.worker import pdf_operation
 from .pdf.chunking import extract_pdf_pages, extract_pdf_raw_text, get_pdf_page_count
 
 logger = logging.getLogger("kitng_doc_parser.pipeline")
@@ -60,6 +64,7 @@ class DocumentParser:
         *,
         chunk_cache: Optional[ChunkCache] = None,
         force: bool = False,
+        budget=None,
     ) -> ParseResult:
         """Определяет формат документа и преобразует его в форматированный Markdown."""
         ext = _ext(ref.file_name)
@@ -71,7 +76,7 @@ class DocumentParser:
         if ext in TEXT_EXTS:
             return self._parse_text_local(ref, data)
         if ext in PDF_EXTS:
-            return await self._parse_pdf(ref, data, chunk_cache, force)
+            return await self._parse_pdf(ref, data, chunk_cache, force, budget)
         if ext in IMAGE_EXTS:
             return await self._parse_image(ref, data)
         if ext in DOCX_EXTS:
@@ -133,17 +138,26 @@ class DocumentParser:
             status="complete",
         )
 
+    def processing_revision(self, data: bytes, cache_generation: str = "") -> str:
+        policy = {"schema": 2, "generation": cache_generation, "parser": "1.1.0", "prompt": "ocr-v1", "chunk_size": self._chunk_size,
+                  "model": self._openrouter.model_name if self._openrouter else None,
+                  "route": getattr(self._openrouter, "_base_url", None), "fallback": self._parse_partial_fallback}
+        return hashlib.sha256(hashlib.sha256(data).digest() + json.dumps(policy, sort_keys=True).encode()).hexdigest()
+
     async def _parse_pdf(
         self,
         ref: DocumentRef,
         data: bytes,
         chunk_cache: Optional[ChunkCache],
         force: bool,
+        budget=None,
     ) -> ParseResult:
         try:
-            total_pages = get_pdf_page_count(data)
+            total_pages = await pdf_operation("count", data, budget)
+        except TimeoutError:
+            raise
         except Exception as ex:
-            raise ValueError(f"Не удалось прочитать PDF: {ex}") from ex
+            raise ValueError(f"PDF metadata unavailable: {type(ex).__name__}") from ex
 
         if total_pages == 0:
             return ParseResult(
@@ -155,7 +169,7 @@ class DocumentParser:
 
         # Если нет OpenRouter или API-ключа, сразу используем быстрый локальный pypdf
         if not self._openrouter or not self._openrouter._api_key:
-            raw = extract_pdf_raw_text(data)
+            raw = await pdf_operation("text", data, budget)
             markdown = self._frontmatter(ref, total_pages, "local_pdf") + raw
             return ParseResult(
                 markdown=markdown,
@@ -166,6 +180,11 @@ class DocumentParser:
 
         if chunk_cache is None:
             return await self._parse_pdf_simple(ref, data, total_pages)
+
+        revision = self.processing_revision(data, ref.cache_generation or (_now() if force else ""))
+        chunk_cache = chunk_cache.for_revision(revision)
+        if force:
+            chunk_cache.clear(ref.scope, ref.item_id)
 
         # Чанковый возобновляемый парсинг через OCR
         plan: List[Tuple[int, int]] = []
@@ -196,21 +215,34 @@ class DocumentParser:
         failed_index: Optional[int] = None
         retryable = False
 
+        new_chunks = 0
+        retry_after = None
         for index, (start, end) in enumerate(plan):
             meta = by_index.setdefault(index, {"index": index, "pages": f"{start}-{end}", "status": "pending"})
             if meta.get("status") == "done" and chunk_cache.get_chunk(ref.scope, ref.item_id, index) is not None:
                 continue
 
+            if budget and new_chunks >= budget.max_new_chunks:
+                break
             try:
-                chunk_data = extract_pdf_pages(data, start, end)
+                if budget: budget.check()
+                chunk_data = await pdf_operation("chunk", data, budget, start, end)
                 prompt = (
                     f"Распознай страницы {start}–{end} из {total_pages} документа "
                     f"'{ref.file_name}' и переведи их в точный Markdown."
                 )
-                chunk_md = await self._openrouter.convert_to_markdown(chunk_data, "application/pdf", prompt)
+                chunk_md = await self._openrouter.convert_to_markdown(chunk_data, "application/pdf", prompt, **({"budget": budget} if budget else {}))
+                if budget: budget.check()
+                new_chunks += 1
                 if not chunk_md or not chunk_md.strip():
                     raise OpenRouterError("Модель вернула пустой ответ.", retryable=True)
+            except TimeoutError:
+                failed_error = "slice_deadline"
+                failed_index = index
+                retryable = True
+                break
             except OpenRouterError as ex:
+                retry_after = ex.retry_after
                 logger.warning("OCR чанка %s (стр. %s–%s) для %s не удался: %s", index, start, end, ref.file_name, ex)
                 meta.update({"status": "failed", "error": ex.message, "retryable": ex.retryable, "parsed_at": _now()})
                 failed_error = ex.message
@@ -229,7 +261,8 @@ class DocumentParser:
             })
             chunk_cache.save_manifest(ref.scope, ref.item_id, manifest)
 
-        done = sum(1 for c in chunks_meta if c.get("status") == "done")
+        done = sum(1 for c in chunks_meta if c.get("status") == "done"
+                   and chunk_cache.get_chunk(ref.scope, ref.item_id, c["index"]) is not None)
         complete = failed_error is None and done == total_chunks
         manifest["status"] = "complete" if complete else "partial"
         chunk_cache.save_manifest(ref.scope, ref.item_id, manifest)
@@ -242,7 +275,7 @@ class DocumentParser:
                 if cached is not None:
                     parts.append(f"<!-- Pages {start} - {end} -->\n\n{cached}")
                     continue
-            if self._parse_partial_fallback:
+            if self._parse_partial_fallback and budget is None:
                 raw = extract_pdf_raw_text(extract_pdf_pages(data, start, end))
                 parts.append(f"<!-- Pages {start} - {end} (pypdf fallback) -->\n\n{raw}")
             else:
@@ -262,6 +295,9 @@ class DocumentParser:
             failed_chunk=failed_index,
             retryable=retryable if not complete else False,
             error=failed_error,
+            retry_after=retry_after,
+            source_revision=hashlib.sha256(data).hexdigest(),
+            processing_revision=revision,
         )
 
     async def _parse_pdf_simple(self, ref: DocumentRef, data: bytes, total_pages: int) -> ParseResult:

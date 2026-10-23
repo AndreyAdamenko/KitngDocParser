@@ -31,6 +31,9 @@ class DocumentRef:
     content_type: Optional[str] = None
     """MIME-тип (если известен)."""
 
+    cache_generation: Optional[str] = None
+    """Explicit fresh processing generation; defaults preserve positional compatibility."""
+
 
 @dataclass
 class ParseResult:
@@ -46,6 +49,9 @@ class ParseResult:
     failed_chunk: Optional[int] = None
     retryable: bool = False
     error: Optional[str] = None
+    retry_after: Optional[float] = None
+    source_revision: Optional[str] = None
+    processing_revision: Optional[str] = None
 
 
 @dataclass
